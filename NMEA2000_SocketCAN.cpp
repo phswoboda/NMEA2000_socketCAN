@@ -45,6 +45,7 @@ See also NMEA2000 library.
 #include <net/if.h>
 #include <linux/can.h>
 #include <linux/can/raw.h>
+#include <cerrno>
 
 //*****************************************************************************
 //  Pass in pointer to character array which contains (or will contain) the
@@ -72,87 +73,84 @@ void tNMEA2000_SocketCAN::SetCANport(char *CANport) {
 
 
 //*****************************************************************************
+tNMEA2000_SocketCAN::~tNMEA2000_SocketCAN() {
+    if (skt >= 0) close(skt);
+}
+
+void tNMEA2000_SocketCAN::CloseSocket() {
+    if (skt >= 0) close(skt);
+    skt = -1;
+    OpenState = os_OpenCAN;
+    OpenScheduler.FromNow(1000);
+}
+
+bool tNMEA2000_SocketCAN::FailOpen(const char *message) {
+    const std::string error = std::string(message) + ": " + _CANport;
+    if (mLastError != error) cerr << error << endl;
+    mLastError = error;
+    CloseSocket();
+    return false;
+}
+
 bool tNMEA2000_SocketCAN::CANOpen() {
-    struct ifreq ifr;
-    struct sockaddr_can addr;
-    int flags;
-
-    //----  Open a socket to the CAN port
-    skt = socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    if(skt < 0) {
-        cerr << "Failed open CAN socket: " << _CANport << endl;
-        return (false);
-        }
-
-    strncpy(ifr.ifr_name, _CANport, (sizeof(ifr.ifr_name)-1));
-    ifr.ifr_name[sizeof(ifr.ifr_name)-1] = '\0';                                          //  (And make sure to null terminate)
-
-    if (ioctl(skt, SIOCGIFINDEX, &ifr) < 0) {
-        cerr << "Failed CAN ioctl: " << ifr.ifr_name << endl;
-        return (false);
-        }
-
+    if (skt >= 0) close(skt);
+    skt = socket(PF_CAN, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, CAN_RAW);
+    if (skt < 0) return FailOpen("Failed open CAN socket");
+    struct ifreq ifr = {};
+    strncpy(ifr.ifr_name, _CANport.c_str(), sizeof(ifr.ifr_name) - 1);
+    if (ioctl(skt, SIOCGIFINDEX, &ifr) < 0) return FailOpen("Failed CAN ioctl");
+    mIfIndex = ifr.ifr_ifindex;
+    if (ioctl(skt, SIOCGIFFLAGS, &ifr) < 0 || !(ifr.ifr_flags & IFF_UP))
+        return FailOpen("CAN interface down");
+    struct sockaddr_can addr = {};
     addr.can_family = AF_CAN;
-    addr.can_ifindex = ifr.ifr_ifindex;
-    if (bind(skt, (struct sockaddr *)&addr, sizeof(addr)) < 0)  {
-        cerr << "Failed CAN bind" << endl;
-        return (false);
-        }
-
-
-    //----- Set socket for non-blocking
-    flags = fcntl(skt, F_GETFL, 0);
-    if (flags < 0) {
-        cerr << "Failed CAN flag fetch" << endl;
-        return (false);
-        }
-
-    if (fcntl(skt, F_SETFL, flags | O_NONBLOCK) < 0) {
-        cerr << "Failed CAN flag set" << endl;
-        return (false);
-        }
-
+    addr.can_ifindex = mIfIndex;
+    if (bind(skt, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0)
+        return FailOpen("Failed CAN bind");
+    mLastError.clear();
+    mNextLinkCheck = millis() + 1000;
     return true;
 }
 
 
 //*****************************************************************************
 bool tNMEA2000_SocketCAN::CANSendFrame(unsigned long id, unsigned char len, const unsigned char *buf, bool wait_sent) {
-   struct can_frame frame_wr;
-
-   frame_wr.can_id  = id | CAN_EFF_FLAG;
-   frame_wr.can_dlc = len;
-   memcpy(frame_wr.data, buf, 8);
-
-   return (write(skt, &frame_wr, sizeof(frame_wr)) == sizeof(frame_wr));        // Send this frame out to the socketCAN handler
-
-             // socketCAN works to keeping all packets in-order, so
-             // no need to do anything special for wait-sent
+    if (skt < 0 || len > 8) return false;
+    struct can_frame frame = {};
+    frame.can_id = id | CAN_EFF_FLAG;
+    frame.can_dlc = len;
+    memcpy(frame.data, buf, len);
+    const auto sent = write(skt, &frame, sizeof(frame));
+    if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS)
+        CloseSocket();
+    return sent == sizeof(frame);
 }
 
-
-//*****************************************************************************
 bool tNMEA2000_SocketCAN::CANGetFrame(unsigned long &id, unsigned char &len, unsigned char *buf) {
-    struct can_frame frame_rd;
-    struct timeval tv = {0, 0};                                                 // Non-blocking timout when checking
-    fd_set fds;
-
-    FD_ZERO(&fds);
-    FD_SET(skt, &fds);
-
-    if (select((skt + 1), &fds, NULL, NULL, &tv) < 0)                           // Is there a FD with something to read out there?
-        return false;
-
-    if (FD_ISSET(skt, &fds)) {                                                  // Was it our CAN file-descriptor that is ready?
-        if (read(skt, &frame_rd, sizeof(frame_rd)) > 0) {
-            memcpy(buf, frame_rd.data, 8);
-            len = frame_rd.can_dlc;
-            id  = frame_rd.can_id;
-            return true;
-            }
+    if (skt < 0) return false;
+    if (int32_t(millis() - mNextLinkCheck) >= 0) {
+        struct ifreq ifr = {};
+        strncpy(ifr.ifr_name, _CANport.c_str(), sizeof(ifr.ifr_name) - 1);
+        if (ioctl(skt, SIOCGIFINDEX, &ifr) < 0 || ifr.ifr_ifindex != mIfIndex
+            || ioctl(skt, SIOCGIFFLAGS, &ifr) < 0 || !(ifr.ifr_flags & IFF_UP)) {
+            CloseSocket();
+            return false;
         }
-    return false;
-
+        mNextLinkCheck = millis() + 1000;
+    }
+    struct can_frame frame = {};
+    const auto received = read(skt, &frame, sizeof(frame));
+    if (received != sizeof(frame)) {
+        if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            CloseSocket();
+        return false;
+    }
+    if (!(frame.can_id & CAN_EFF_FLAG) || frame.can_id & (CAN_RTR_FLAG | CAN_ERR_FLAG) || frame.can_dlc > 8)
+        return false;
+    memcpy(buf, frame.data, frame.can_dlc);
+    len = frame.can_dlc;
+    id = frame.can_id & CAN_EFF_MASK;
+    return true;
 }
 
 

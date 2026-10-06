@@ -38,6 +38,7 @@ Inherited NMEA2000 object for socketCAN setup. See also NMEA2000 library.
 #include <stdio.h>
 #include <NMEA2000.h>
 #include <N2kMsg.h>
+#include <string>
 
 using namespace std;
 
@@ -52,12 +53,19 @@ protected:
     bool CANOpen();
     bool CANGetFrame(unsigned long &id, unsigned char &len, unsigned char *buf);
 
-    int   skt;
-    char*  _CANport;
+    int skt = -1;
+    int mIfIndex = 0;
+    uint32_t mNextLinkCheck = 0;
+    std::string _CANport;
+    std::string mLastError;
+    void CloseSocket();
+    bool FailOpen(const char *message);
 
 
 public:
     tNMEA2000_SocketCAN(char* CANport=NULL);
+    ~tNMEA2000_SocketCAN();
+    bool SocketOpen() const { return skt >= 0; }
     void     SetCANport(char *CANport=NULL);                // If used, must be called before CANOpen() 
 
 };
